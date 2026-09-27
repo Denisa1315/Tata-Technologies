@@ -1,0 +1,8 @@
+opencv-python
+ultralytics
+numpy
+filterpy
+pyserial
+pandas
+lap
+pyyaml

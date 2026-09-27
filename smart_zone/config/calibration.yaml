@@ -1,0 +1,9 @@
+# Placeholder for spatial/calibration.py (homography, camera intrinsics/extrinsics).
+# Populated in the spatial-calibration section of the build.
+camera:
+  intrinsics: null
+  extrinsics: null
+homography:
+  matrix: null
+  ground_plane_points_image: []
+  ground_plane_points_world: []

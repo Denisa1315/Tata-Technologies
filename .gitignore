@@ -3,6 +3,13 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Downloaded model weights (auto-fetched by ultralytics on first run)
+*.pt
+smart_zone/runs/
+
+# Local offline event log (source of truth, but per-machine, not versioned)
+smart_zone/logs/
+
 # C extensions
 *.so
 

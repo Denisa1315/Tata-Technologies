@@ -1,0 +1,27 @@
+perception:
+  detection:
+    model: "yolov8n.pt"
+    confidence_threshold: 0.5
+    classes: [0]  # COCO class 0 = person
+  tracking:
+    persistence_frames: 3  # min consecutive frames before a track is "trusted"
+    tracker_config: "bytetrack.yaml"
+
+# PLACEHOLDER values -- replace with real measurements from your excavator.
+# pivot_m should be wherever you chose your calibration's world-coordinate
+# origin to sit relative to the machine (e.g. (0,0) if you calibrated with
+# the origin at the machine's base/slew axis).
+machine_geometry:
+  pivot_m: [0.0, 0.0]   # slew-axis location, ground-plane meters
+  radius_m: 3.0         # arm/boom length, meters
+
+safety:
+  zone:
+    core_ratio: 0.5       # CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse
+  risk_engine:
+    ttc_warning_s: 4.0
+    ttc_critical_s: 1.5
+    debounce_s: 1.0
+    fps_floor: 8.0
+    camera_timeout_s: 0.5
+    telemetry_max_age_s: 0.5
