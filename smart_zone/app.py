@@ -18,6 +18,7 @@ Press Ctrl+C to stop.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -25,8 +26,10 @@ import cv2
 import serial
 import yaml
 
+from smart_zone.dashboard.sim_view import SimView, SimViewState, TransitionRecord, WorkerViewState
 from smart_zone.hardware.mock_outputs import MockHardwareOutputs
 from smart_zone.hardware.outputs import HardwareOutputs
+from smart_zone.hardware.sim_outputs import SimHardwareOutputs
 from smart_zone.logging.event_logger import EventLogger, EventRecord
 from smart_zone.machine.mock_telemetry import MockMachineTelemetry
 from smart_zone.machine.telemetry import MachineTelemetry
@@ -35,9 +38,10 @@ from smart_zone.prediction.kalman import WorkerKalmanBank
 from smart_zone.prediction.ttc import time_to_collision_s
 from smart_zone.safety.risk_engine import HealthStatus, RiskEngine, RiskState, WorkerObservation
 from smart_zone.safety.zone import (
-    compute_core_zone_geometry,
+    compute_caution_zone_geometry,
     compute_zone_geometry,
-    is_point_inside_zone,
+    tangential_speed_m_s,
+    zone_level_for_point,
 )
 from smart_zone.spatial.homography import (
     CALIBRATION_YAML_PATH,
@@ -52,6 +56,7 @@ _PLACEHOLDER_IMAGE_POINTS = [(80.0, 480.0), (560.0, 480.0), (560.0, 240.0), (80.
 _PLACEHOLDER_WORLD_POINTS = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)]
 
 DEFAULT_BAUD_RATE = 115200
+DEFAULT_SIM_ANGULAR_SPEED_DEG_S = 20.0
 DISPLAY_COLOR_BY_STATE = {
     RiskState.SAFE: (0, 200, 0),
     RiskState.WARNING: (0, 200, 255),
@@ -81,41 +86,65 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Smart-Zone Edge Guardian")
     parser.add_argument("--mock-hardware", action="store_true",
                          help="Use mock telemetry and print actions instead of opening a serial port.")
+    parser.add_argument("--sim", action="store_true",
+                         help="Use mock telemetry + in-process simulated outputs (readable state, no printing, "
+                              "no serial port) -- STOP/RESUME really freeze/resume the simulated arm.")
     parser.add_argument("--serial-port", default=None,
-                         help="Serial device for the ESP32 (e.g. /dev/tty.usbserial-XXXX). Required unless --mock-hardware.")
+                         help="Serial device for the ESP32 (e.g. /dev/tty.usbserial-XXXX). Required unless --mock-hardware/--sim.")
     parser.add_argument("--baud-rate", type=int, default=DEFAULT_BAUD_RATE)
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--no-display", action="store_true",
                          help="Don't open a live camera preview window.")
+    parser.add_argument("--record", default=None, metavar="PATH.mp4",
+                         help="Save the composed sim-view window to this video file (--sim only).")
+    parser.add_argument("--no-webcam-inset", action="store_true",
+                         help="Hide the live-webcam inset in the sim view (for headless testing).")
     return parser.parse_args()
+
+
+def _keyboard_speed_step(current_speed: float) -> float:
+    return max(1.0, current_speed * 0.25)
 
 
 def main() -> None:
     args = parse_args()
-    if not args.mock_hardware and not args.serial_port:
-        raise SystemExit("Either --mock-hardware or --serial-port <device> is required.")
+    if not args.mock_hardware and not args.sim and not args.serial_port:
+        raise SystemExit("One of --mock-hardware, --sim, or --serial-port <device> is required.")
 
     thresholds = _load_thresholds()
     pivot = tuple(thresholds["machine_geometry"]["pivot_m"])
     radius_m = thresholds["machine_geometry"]["radius_m"]
-    core_ratio = thresholds["safety"]["zone"]["core_ratio"]
+    zone_cfg = thresholds["safety"]["zone"]
     risk_cfg = thresholds["safety"]["risk_engine"]
 
     matrix, _is_placeholder = _load_homography()
 
     tracker = PersonTracker()
     kalman_bank = WorkerKalmanBank()
-    risk_engine = RiskEngine(
-        ttc_warning_s=risk_cfg["ttc_warning_s"],
-        ttc_critical_s=risk_cfg["ttc_critical_s"],
-        debounce_s=risk_cfg["debounce_s"],
-        fps_floor=risk_cfg["fps_floor"],
-    )
+
+    def _build_risk_engine() -> RiskEngine:
+        return RiskEngine(
+            use_prediction=risk_cfg["use_prediction"],
+            ttc_warning_s=risk_cfg["ttc_warning_s"],
+            ttc_critical_s=risk_cfg["ttc_critical_s"],
+            debounce_s=risk_cfg["debounce_s"],
+            fps_floor=risk_cfg["fps_floor"],
+            quiet_when_stationary=risk_cfg["quiet_when_stationary"],
+            stationary_speed_threshold_m_s=risk_cfg["stationary_speed_threshold_m_s"],
+            arm_reach_m=radius_m,
+        )
+
+    risk_engine = _build_risk_engine()
     event_logger = EventLogger()
 
     ser = None
-    if args.mock_hardware:
-        machine = MockMachineTelemetry(angle_min_deg=-45.0, angle_max_deg=45.0, angular_speed_deg_s=20.0)
+    if args.sim:
+        machine = MockMachineTelemetry(angle_min_deg=-45.0, angle_max_deg=45.0,
+                                        angular_speed_deg_s=DEFAULT_SIM_ANGULAR_SPEED_DEG_S)
+        hardware = SimHardwareOutputs(machine)
+    elif args.mock_hardware:
+        machine = MockMachineTelemetry(angle_min_deg=-45.0, angle_max_deg=45.0,
+                                        angular_speed_deg_s=DEFAULT_SIM_ANGULAR_SPEED_DEG_S)
         hardware = MockHardwareOutputs()
     else:
         ser = serial.Serial(args.serial_port, args.baud_rate, timeout=1.0)
@@ -134,11 +163,33 @@ def main() -> None:
     fps = 0.0
     last_reported_state: RiskState | None = None
 
+    # --sim-only demo/orchestration state. sim_view.py never touches these
+    # decisions itself -- it only reports which key was pressed each frame
+    # (poll_keys()); interpreting a key press as "simulate a camera fault"
+    # or "reset the scenario" happens here, in app.py.
+    sim_view = SimView(show_webcam_inset=not args.no_webcam_inset) if args.sim else None
+    camera_fault_simulated = False
+    recent_transitions: list[TransitionRecord] = []
+    video_writer = None
+    snapshot_count = 0
+
+    if args.sim and args.record:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        video_writer = cv2.VideoWriter(args.record, fourcc, 20.0, (1280, 720))
+        if not video_writer.isOpened():
+            raise RuntimeError(f"Could not open video writer for {args.record}")
+
     print("Smart-Zone Edge Guardian running. Press Ctrl+C to stop.\n")
     try:
         while True:
             ok, frame = cap.read()
             now = time.time()
+
+            # A simulated camera fault is treated exactly like a real camera
+            # loss: it overrides `ok`/camera_alive for this frame, same as
+            # if the lens were actually covered and cap.read() kept failing.
+            if camera_fault_simulated:
+                ok = False
 
             if ok:
                 last_frame_time = now
@@ -149,7 +200,23 @@ def main() -> None:
             fps = 0.9 * fps + 0.1 * (1.0 / loop_dt) if fps > 0 else (1.0 / loop_dt)
 
             worker_observations: list[WorkerObservation] = []
+            worker_view_states: list[WorkerViewState] = []
             trusted = []
+
+            machine_speed_m_s = tangential_speed_m_s(machine.speed_deg_s, radius_m)
+            danger_zone = compute_zone_geometry(
+                pivot=pivot,
+                current_angle_deg=machine.angle_deg,
+                angular_speed_deg_s=machine.speed_deg_s,
+                radius_m=radius_m,
+                stopping_coeff=zone_cfg["stopping_coeff"],
+                human_speed_mps=zone_cfg["human_speed_mps"],
+                reaction_time_s=zone_cfg["reaction_time_s"],
+                margin_m=zone_cfg["margin_m"],
+                baseline_radius_m=zone_cfg["baseline_radius_m"],
+                offset_ratio=zone_cfg["offset_ratio"],
+            )
+            caution_zone = compute_caution_zone_geometry(danger_zone, caution_band_m=zone_cfg["caution_band_m"])
 
             if ok:
                 tracked = tracker.update(frame)
@@ -159,26 +226,30 @@ def main() -> None:
                 for stale_id in kalman_bank.active_track_ids() - active_ids:
                     kalman_bank.drop(stale_id)
 
-                outer_zone = compute_zone_geometry(
-                    pivot=pivot,
-                    current_angle_deg=machine.angle_deg,
-                    angular_speed_deg_s=machine.speed_deg_s,
-                    radius_m=radius_m,
-                )
-                core_zone = compute_core_zone_geometry(outer_zone, core_ratio=core_ratio)
-
                 for t in trusted:
                     ground_pos = bbox_to_ground_position(matrix, t.bbox_xyxy)
                     estimate = kalman_bank.update(t.track_id, ground_pos, loop_dt)
                     position = (estimate.x, estimate.y)
 
-                    in_outer_margin = is_point_inside_zone(outer_zone, position)
-                    in_core = is_point_inside_zone(core_zone, position)
-                    ttc = time_to_collision_s(position, (estimate.vx, estimate.vy), outer_zone)
+                    zone_level = zone_level_for_point(danger_zone, caution_zone, position)
+                    distance_from_pivot = math.hypot(position[0] - pivot[0], position[1] - pivot[1])
+
+                    # Kalman stays only a position smoother -- its
+                    # forecast/velocity is only consulted for TTC when
+                    # use_prediction is explicitly on, never for the
+                    # position-only decision path.
+                    ttc = None
+                    if risk_cfg["use_prediction"]:
+                        ttc = time_to_collision_s(position, (estimate.vx, estimate.vy), caution_zone)
 
                     worker_observations.append(WorkerObservation(
-                        position=position, ttc_s=ttc,
-                        in_outer_margin=in_outer_margin, in_core=in_core,
+                        position=position, zone_level=zone_level,
+                        distance_from_pivot_m=distance_from_pivot, ttc_s=ttc,
+                    ))
+                    worker_view_states.append(WorkerViewState(
+                        track_id=t.track_id, position=position,
+                        forecast_position=(estimate.forecast_x, estimate.forecast_y),
+                        zone_level=zone_level.value,
                     ))
 
             health = HealthStatus(
@@ -186,8 +257,8 @@ def main() -> None:
                 telemetry_alive=machine.is_alive(max_age_s=telemetry_max_age_s),
                 fps=fps,
             )
-            assessment = risk_engine.evaluate(worker_observations, health)
-            hardware.apply_state(assessment.state)
+            assessment = risk_engine.evaluate(worker_observations, health, machine_speed_m_s)
+            hardware.apply_state(assessment.state, buzzer_should_sound=assessment.buzzer_should_sound)
 
             if assessment.state != last_reported_state:
                 print(
@@ -204,9 +275,82 @@ def main() -> None:
                     machine_speed_deg_s=machine.speed_deg_s,
                     camera_health=camera_alive,
                 ))
+                if last_reported_state is not None:
+                    recent_transitions.append(TransitionRecord(
+                        timestamp=now,
+                        from_state=last_reported_state.name,
+                        to_state=assessment.state.name,
+                        ttc_s=assessment.min_ttc_s,
+                    ))
                 last_reported_state = assessment.state
 
-            if ok and not args.no_display:
+            if args.sim and sim_view is not None:
+                webcam_inset = None
+                if not args.no_webcam_inset and ok:
+                    webcam_inset = frame.copy()
+                    color = DISPLAY_COLOR_BY_STATE[assessment.state]
+                    for t in trusted:
+                        x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy)
+                        cv2.rectangle(webcam_inset, (x1, y1), (x2, y2), color, 2)
+
+                view_state = SimViewState(
+                    risk_state=assessment.state.name,
+                    ttc_s=assessment.min_ttc_s,
+                    machine_pivot=pivot,
+                    machine_angle_deg=machine.angle_deg,
+                    machine_speed_deg_s=machine.speed_deg_s,
+                    machine_arm_length_m=radius_m,
+                    machine_running=(machine.state == "RUNNING"),
+                    zone_center=danger_zone.center,
+                    zone_orientation_deg=danger_zone.orientation_deg,
+                    zone_caution_semi_major_m=caution_zone.semi_major_m,
+                    zone_caution_semi_minor_m=caution_zone.semi_minor_m,
+                    zone_danger_semi_major_m=danger_zone.semi_major_m,
+                    zone_danger_semi_minor_m=danger_zone.semi_minor_m,
+                    workers=worker_view_states,
+                    led_level=hardware.led_level,
+                    buzzer_on=hardware.buzzer_on,
+                    stop_active=hardware.stop_active,
+                    fps=fps,
+                    camera_alive=camera_alive,
+                    telemetry_alive=health.telemetry_alive,
+                    camera_fault_simulated=camera_fault_simulated,
+                    recent_transitions=recent_transitions,
+                    webcam_frame=webcam_inset,
+                )
+                canvas = sim_view.render(view_state)
+                sim_view.show(canvas)
+
+                if video_writer is not None:
+                    video_writer.write(canvas)
+
+                key = sim_view.poll_keys(wait_ms=1)
+                if key == "q":
+                    break
+                elif key == "c":
+                    camera_fault_simulated = not camera_fault_simulated
+                elif key == "r":
+                    # Reset the scenario: arm angle/speed back to the
+                    # starting point, and the risk engine's state/hysteresis
+                    # timers start clean too.
+                    machine.reset(angular_speed_deg_s=DEFAULT_SIM_ANGULAR_SPEED_DEG_S)
+                    risk_engine = _build_risk_engine()
+                    last_reported_state = None
+                    recent_transitions.clear()
+                    camera_fault_simulated = False
+                elif key == "+":
+                    current_speed = abs(machine.speed_deg_s) or DEFAULT_SIM_ANGULAR_SPEED_DEG_S
+                    machine.set_speed(current_speed + _keyboard_speed_step(current_speed))
+                elif key == "-":
+                    current_speed = abs(machine.speed_deg_s) or DEFAULT_SIM_ANGULAR_SPEED_DEG_S
+                    machine.set_speed(max(1.0, current_speed - _keyboard_speed_step(current_speed)))
+                elif key == "s":
+                    snapshot_count += 1
+                    snap_path = f"sim_view_snapshot_{snapshot_count}.png"
+                    cv2.imwrite(snap_path, canvas)
+                    print(f"Saved snapshot: {snap_path}")
+
+            elif ok and not args.no_display:
                 color = DISPLAY_COLOR_BY_STATE[assessment.state]
                 for t in trusted:
                     x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy)
@@ -226,6 +370,8 @@ def main() -> None:
         machine.close()
         if ser is not None:
             ser.close()
+        if video_writer is not None:
+            video_writer.release()
 
 
 if __name__ == "__main__":

@@ -17,11 +17,28 @@ machine_geometry:
 
 safety:
   zone:
-    core_ratio: 0.5       # CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse
+    # protective_distance = stopping_coeff * tangential_speed
+    #                       + human_speed_mps * reaction_time_s + margin_m
+    # Tuned so protective_distance (the danger-zone size) is about 0.8m at a
+    # realistic top swing speed (~1.0-1.2 m/s tangential for a small
+    # excavator), and the whole zone (danger + caution_band_m) fits within
+    # roughly 1.5-2m across the working speed range. See safety/zone.py for
+    # the full formula documentation.
+    stopping_coeff: 0.3       # seconds-equivalent braking-response coefficient
+    human_speed_mps: 1.6      # assumed worker walking speed
+    reaction_time_s: 0.3      # assumed worker/system reaction time
+    margin_m: 0.1             # fixed safety pad added to protective_distance
+    caution_band_m: 0.7       # width of the outer caution ring beyond the danger ellipse
+    baseline_radius_m: 0.58   # zone size (circle) when the machine is stationary
+    offset_ratio: 0.3         # danger-ellipse center offset toward swing heading, as a fraction of tangential speed's contribution to protective_distance
+    core_ratio: 0.5       # legacy: CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse -- only used when use_prediction is true
   risk_engine:
+    use_prediction: false  # false = decide from position/zone-level only; true = restore old TTC+forecast behavior
     ttc_warning_s: 4.0
     ttc_critical_s: 1.5
     debounce_s: 1.0
     fps_floor: 8.0
     camera_timeout_s: 0.5
     telemetry_max_age_s: 0.5
+    quiet_when_stationary: true   # when the arm is stopped/slow: cap at WARNING (silent) unless worker is within arm_reach_m
+    stationary_speed_threshold_m_s: 0.05  # tangential speed below which the machine is considered "stationary"
