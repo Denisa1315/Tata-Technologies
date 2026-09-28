@@ -10,6 +10,9 @@ smart_zone/runs/
 # Local offline event log (source of truth, but per-machine, not versioned)
 smart_zone/logs/
 
+# Demo/recording video output (large binaries, not source)
+*.mp4
+
 # C extensions
 *.so
 
