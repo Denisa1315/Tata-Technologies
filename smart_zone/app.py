@@ -26,18 +26,32 @@ import cv2
 import serial
 import yaml
 
-from smart_zone.dashboard.sim_view import SimView, SimViewState, TransitionRecord, WorkerViewState
+from smart_zone.dashboard.sim_view import (
+    SimView,
+    SimViewState,
+    SummaryViewState,
+    TransitionRecord,
+    WorkerViewState,
+)
 from smart_zone.hardware.mock_outputs import MockHardwareOutputs
 from smart_zone.hardware.outputs import HardwareOutputs
 from smart_zone.hardware.sim_outputs import SimHardwareOutputs
-from smart_zone.logging.event_logger import EventLogger, EventRecord
+from smart_zone.logging.event_logger import EventLogger, EventRecord, TransitionTracker
+from smart_zone.logging.summary import RunSummary
 from smart_zone.machine.mock_telemetry import MockMachineTelemetry
 from smart_zone.machine.telemetry import MachineTelemetry
 from smart_zone.perception.tracking import PersonTracker
 from smart_zone.prediction.kalman import WorkerKalmanBank
 from smart_zone.prediction.ttc import time_to_collision_s
+from smart_zone.safety.confidence import (
+    PositionConfidence,
+    apply_confidence_to_zone_level,
+    assess_confidence,
+    range_based_margin_m,
+)
 from smart_zone.safety.risk_engine import HealthStatus, RiskEngine, RiskState, WorkerObservation
 from smart_zone.safety.zone import (
+    ZoneLevel,
     compute_caution_zone_geometry,
     compute_zone_geometry,
     tangential_speed_m_s,
@@ -114,8 +128,10 @@ def main() -> None:
     thresholds = _load_thresholds()
     pivot = tuple(thresholds["machine_geometry"]["pivot_m"])
     radius_m = thresholds["machine_geometry"]["radius_m"]
+    camera_ground_position = tuple(thresholds["camera_geometry"]["ground_position_m"])
     zone_cfg = thresholds["safety"]["zone"]
     risk_cfg = thresholds["safety"]["risk_engine"]
+    confidence_cfg = thresholds["safety"]["confidence"]
 
     matrix, _is_placeholder = _load_homography()
 
@@ -136,6 +152,8 @@ def main() -> None:
 
     risk_engine = _build_risk_engine()
     event_logger = EventLogger()
+    transition_tracker = TransitionTracker()
+    run_summary = RunSummary()
 
     ser = None
     if args.sim:
@@ -201,7 +219,10 @@ def main() -> None:
 
             worker_observations: list[WorkerObservation] = []
             worker_view_states: list[WorkerViewState] = []
+            worker_log_basics: list[dict] = []  # per-worker fields known before the risk decision
             trusted = []
+            any_caution = False
+            any_danger = False
 
             machine_speed_m_s = tangential_speed_m_s(machine.speed_deg_s, radius_m)
             danger_zone = compute_zone_geometry(
@@ -221,6 +242,7 @@ def main() -> None:
             if ok:
                 tracked = tracker.update(frame)
                 trusted = PersonTracker.trusted_only(tracked)
+                frame_height_px = frame.shape[0]
 
                 active_ids = {t.track_id for t in trusted}
                 for stale_id in kalman_bank.active_track_ids() - active_ids:
@@ -231,8 +253,38 @@ def main() -> None:
                     estimate = kalman_bank.update(t.track_id, ground_pos, loop_dt)
                     position = (estimate.x, estimate.y)
 
-                    zone_level = zone_level_for_point(danger_zone, caution_zone, position)
-                    distance_from_pivot = math.hypot(position[0] - pivot[0], position[1] - pivot[1])
+                    raw_zone_level = zone_level_for_point(danger_zone, caution_zone, position)
+
+                    conf = assess_confidence(
+                        bbox_xyxy=t.bbox_xyxy, ground_position=position,
+                        camera_ground_position=camera_ground_position, machine_pivot=pivot,
+                        frame_height_px=frame_height_px,
+                        edge_margin_px=confidence_cfg["edge_margin_px"],
+                        height_disagreement_ratio_threshold=confidence_cfg["height_disagreement_ratio"],
+                        reference_height_px_at_1m=confidence_cfg["reference_height_px_at_1m"],
+                    )
+
+                    # Range-based margin: widen the caution band by an
+                    # amount that grows with distance_to_camera_m, and
+                    # reclassify against that widened zone -- used only to
+                    # decide the LOW-confidence OUTSIDE->CAUTION escalation,
+                    # not as the zone_level workers are normally judged by.
+                    margin_m = range_based_margin_m(
+                        conf.distance_to_camera_m,
+                        slope_m_per_m=confidence_cfg["range_margin_slope_m_per_m"],
+                        max_margin_m=confidence_cfg["range_margin_max_m"],
+                    )
+                    widened_caution_zone = compute_caution_zone_geometry(
+                        danger_zone, caution_band_m=zone_cfg["caution_band_m"] + margin_m
+                    )
+                    zone_level_with_margin = zone_level_for_point(danger_zone, widened_caution_zone, position)
+
+                    zone_level = apply_confidence_to_zone_level(
+                        raw_zone_level, conf.confidence, zone_level_with_margin
+                    )
+
+                    any_caution = any_caution or zone_level == ZoneLevel.CAUTION
+                    any_danger = any_danger or zone_level == ZoneLevel.DANGER
 
                     # Kalman stays only a position smoother -- its
                     # forecast/velocity is only consulted for TTC when
@@ -244,12 +296,20 @@ def main() -> None:
 
                     worker_observations.append(WorkerObservation(
                         position=position, zone_level=zone_level,
-                        distance_from_pivot_m=distance_from_pivot, ttc_s=ttc,
+                        distance_from_pivot_m=conf.distance_to_machine_m, ttc_s=ttc,
                     ))
                     worker_view_states.append(WorkerViewState(
                         track_id=t.track_id, position=position,
                         forecast_position=(estimate.forecast_x, estimate.forecast_y),
-                        zone_level=zone_level.value,
+                        zone_level=zone_level.value, position_confidence=conf.confidence.value,
+                    ))
+                    worker_log_basics.append(dict(
+                        worker_label=f"track_{t.track_id}",
+                        ground_x=position[0], ground_y=position[1],
+                        distance_to_camera_m=conf.distance_to_camera_m,
+                        distance_to_machine_m=conf.distance_to_machine_m,
+                        zone_level=zone_level.value, position_confidence=conf.confidence.value,
+                        feet_visible=conf.feet_visible,
                     ))
 
             health = HealthStatus(
@@ -260,6 +320,36 @@ def main() -> None:
             assessment = risk_engine.evaluate(worker_observations, health, machine_speed_m_s)
             hardware.apply_state(assessment.state, buzzer_should_sound=assessment.buzzer_should_sound)
 
+            frame_to_decision_ms = (time.time() - now) * 1000.0
+            stop_issued = assessment.state in {RiskState.CRITICAL, RiskState.DEGRADED}
+
+            def _build_record(basics: dict) -> EventRecord:
+                return EventRecord(
+                    machine_angle_deg=machine.angle_deg, machine_speed_deg_s=machine.speed_deg_s,
+                    system_state=assessment.state.name, stop_issued=stop_issued,
+                    telemetry_health=health.telemetry_alive,
+                    pipeline_fps=fps, frame_to_decision_ms=frame_to_decision_ms,
+                    camera_health=camera_alive,
+                    **basics,
+                )
+
+            worker_log_records = [_build_record(b) for b in worker_log_basics]
+            system_only_record = _build_record(dict(
+                worker_label="", ground_x=0.0, ground_y=0.0,
+                distance_to_camera_m=0.0, distance_to_machine_m=0.0,
+                zone_level="", position_confidence="", feet_visible=False,
+            ))
+            for row in transition_tracker.rows_to_log(
+                worker_log_records, assessment.state.name, system_only_record=system_only_record
+            ):
+                event_logger.log_event(row)
+
+            run_summary.record_frame(
+                now_s=now, any_worker_in_caution=any_caution, any_worker_in_danger=any_danger,
+                stop_active=stop_issued, camera_alive=camera_alive, telemetry_alive=health.telemetry_alive,
+                frame_to_decision_ms=frame_to_decision_ms,
+            )
+
             if assessment.state != last_reported_state:
                 print(
                     f"[{time.strftime('%H:%M:%S')}] STATE -> {assessment.state.name}  "
@@ -267,14 +357,6 @@ def main() -> None:
                     f"angle={machine.angle_deg:.1f}, speed={machine.speed_deg_s:.1f}, "
                     f"fps={fps:.1f}, camera_alive={camera_alive})"
                 )
-                event_logger.log_transition(EventRecord(
-                    state=assessment.state.name,
-                    ttc_s=assessment.min_ttc_s,
-                    worker_count=len(worker_observations),
-                    machine_angle_deg=machine.angle_deg,
-                    machine_speed_deg_s=machine.speed_deg_s,
-                    camera_health=camera_alive,
-                ))
                 if last_reported_state is not None:
                     recent_transitions.append(TransitionRecord(
                         timestamp=now,
@@ -317,6 +399,16 @@ def main() -> None:
                     camera_fault_simulated=camera_fault_simulated,
                     recent_transitions=recent_transitions,
                     webcam_frame=webcam_inset,
+                    summary=SummaryViewState(
+                        caution_events=run_summary.caution_events,
+                        danger_events=run_summary.danger_events,
+                        time_in_danger_s=run_summary.time_in_danger_s,
+                        stop_commands=run_summary.stop_commands,
+                        camera_faults=run_summary.camera_faults,
+                        telemetry_faults=run_summary.telemetry_faults,
+                        latency_avg_ms=run_summary.latency.average_ms,
+                        latency_max_ms=run_summary.latency.max_ms,
+                    ),
                 )
                 canvas = sim_view.render(view_state)
                 sim_view.show(canvas)
@@ -335,6 +427,7 @@ def main() -> None:
                     # timers start clean too.
                     machine.reset(angular_speed_deg_s=DEFAULT_SIM_ANGULAR_SPEED_DEG_S)
                     risk_engine = _build_risk_engine()
+                    transition_tracker = TransitionTracker()
                     last_reported_state = None
                     recent_transitions.clear()
                     camera_fault_simulated = False
@@ -365,6 +458,7 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopped.")
     finally:
+        run_summary.print_summary()
         cap.release()
         cv2.destroyAllWindows()
         machine.close()

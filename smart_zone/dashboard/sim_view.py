@@ -67,6 +67,21 @@ class WorkerViewState:
     position: tuple[float, float]
     forecast_position: tuple[float, float]
     zone_level: str  # "OUTSIDE" / "CAUTION" / "DANGER" -- ZoneLevel.value, kept as a plain str so sim_view has no dependency on safety.zone's enum type
+    position_confidence: str = "HIGH"  # "HIGH" / "LOW" -- PositionConfidence.value, plain str for the same reason
+
+
+@dataclass(frozen=True)
+class SummaryViewState:
+    """Mirrors logging.summary.RunSummary's public counters -- plain data
+    only, so sim_view stays decoupled from that module too."""
+    caution_events: int
+    danger_events: int
+    time_in_danger_s: float
+    stop_commands: int
+    camera_faults: int
+    telemetry_faults: int
+    latency_avg_ms: float
+    latency_max_ms: float
 
 
 @dataclass(frozen=True)
@@ -111,6 +126,8 @@ class SimViewState:
     recent_transitions: list[TransitionRecord]
 
     webcam_frame: np.ndarray | None  # already has detection boxes drawn on it, or None
+
+    summary: SummaryViewState | None = None
 
 
 class SimView:
@@ -165,9 +182,16 @@ class SimView:
             forecast_px = self._world_to_px(w.forecast_position)
 
             dot_color = ZONE_LEVEL_COLOR.get(w.zone_level, (255, 255, 255))
+            # LOW confidence draws a thin outline ring around the dot, so
+            # it's visually distinguishable without needing a second color.
+            if w.position_confidence == "LOW":
+                cv2.circle(canvas, pos_px, 11, dot_color, 1)
             cv2.circle(canvas, pos_px, 7, dot_color, -1)
             cv2.line(canvas, pos_px, forecast_px, COLOR_FORECAST, 2)
-            cv2.putText(canvas, f"id={w.track_id} [{w.zone_level}]", (pos_px[0] + 10, pos_px[1] - 10),
+            label = f"id={w.track_id} [{w.zone_level}]"
+            if w.position_confidence == "LOW":
+                label += " (LOW conf)"
+            cv2.putText(canvas, label, (pos_px[0] + 10, pos_px[1] - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_TEXT, 1)
 
     def _draw_main_area(self, canvas: np.ndarray, state: SimViewState) -> None:
@@ -243,6 +267,23 @@ class SimView:
                 color = (0, 0, 255)
             cv2.putText(canvas, line, (x0 + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             y += 26
+
+        if state.summary is not None:
+            y += 10
+            cv2.line(canvas, (x0 + 10, y), (x1 - 10, y), COLOR_AXIS, 1)
+            y += 20
+            s = state.summary
+            summary_lines = [
+                f"CAUTION events: {s.caution_events}",
+                f"DANGER events:  {s.danger_events}",
+                f"time in DANGER: {s.time_in_danger_s:.1f}s",
+                f"STOP commands:  {s.stop_commands}",
+                f"cam/telem flts: {s.camera_faults}/{s.telemetry_faults}",
+                f"latency avg/max:{s.latency_avg_ms:.0f}/{s.latency_max_ms:.0f}ms",
+            ]
+            for line in summary_lines:
+                cv2.putText(canvas, line, (x0 + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, COLOR_TEXT, 1)
+                y += 22
 
     def _draw_webcam_inset(self, canvas: np.ndarray, state: SimViewState) -> None:
         if not self.show_webcam_inset or state.webcam_frame is None:

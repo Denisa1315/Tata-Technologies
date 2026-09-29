@@ -15,6 +15,13 @@ machine_geometry:
   pivot_m: [0.0, 0.0]   # slew-axis location, ground-plane meters
   radius_m: 3.0         # arm/boom length, meters
 
+# Camera's own ground-plane position, in the same world coordinates as
+# pivot_m -- used only for distance_to_camera_m (localization-confidence
+# range weighting). Zone/risk decisions never use this, only
+# distance_to_machine_m (from pivot_m).
+camera_geometry:
+  ground_position_m: [0.0, -1.0]  # PLACEHOLDER -- measure your camera's real position
+
 safety:
   zone:
     # protective_distance = stopping_coeff * tangential_speed
@@ -42,3 +49,16 @@ safety:
     telemetry_max_age_s: 0.5
     quiet_when_stationary: true   # when the arm is stopped/slow: cap at WARNING (silent) unless worker is within arm_reach_m
     stationary_speed_threshold_m_s: 0.05  # tangential speed below which the machine is considered "stationary"
+
+  # Position-confidence scoring: flags a worker's ground-plane position as
+  # LOW confidence when the detection itself looks unreliable (feet cut off
+  # by the frame edge, or box height inconsistent with the projected
+  # ground-plane distance), and grows the caution band with range to
+  # account for growing localization error at a distance. See
+  # safety/confidence.py for the full formula documentation.
+  confidence:
+    edge_margin_px: 8               # box bottom within this many px of the frame edge -> feet not visible
+    height_disagreement_ratio: 0.35  # |actual - expected| / expected box height beyond this -> LOW confidence
+    reference_height_px_at_1m: 800   # calibrate once: a person's box height (px) at 1m from the camera
+    range_margin_slope_m_per_m: 0.05  # extra caution-band meters per meter of distance_to_camera_m
+    range_margin_max_m: 0.5          # cap on the range-based margin addition
