@@ -37,6 +37,7 @@ from smart_zone.dashboard.sim_view import (
     WorkerViewState,
 )
 from smart_zone.dashboard.sound import SoundController
+from smart_zone.dashboard.web_launcher import WebSimLauncher
 from smart_zone.hardware.mock_outputs import MockHardwareOutputs
 from smart_zone.hardware.outputs import HardwareOutputs
 from smart_zone.hardware.sim_outputs import SimHardwareOutputs
@@ -193,6 +194,7 @@ def main() -> None:
     hologram_view = HologramView() if args.sim else None
     hologram_enabled = False
     sound_controller = SoundController() if args.sim else None
+    web_sim_launcher = WebSimLauncher() if args.sim else None
     camera_fault_simulated = False
     recent_transitions: list[TransitionRecord] = []
     video_writer = None
@@ -460,6 +462,14 @@ def main() -> None:
                     # own dark aesthetic is untouched either way.
                     new_theme = sim_view.toggle_theme()
                     print(f"Theme -> {new_theme.name}")
+                elif key == "w":
+                    # Opaque launcher for the exported AI Studio simulation
+                    # in simulation/ -- launch() returns immediately (the
+                    # actual npm dev server start + port wait happens on
+                    # its own background thread), and is a no-op on repeat
+                    # presses once already started. Touches nothing in
+                    # perception/prediction/safety.
+                    web_sim_launcher.launch()
                 elif key == "c":
                     camera_fault_simulated = not camera_fault_simulated
                 elif key == "r":
@@ -507,6 +517,8 @@ def main() -> None:
             ser.close()
         if video_writer is not None:
             video_writer.release()
+        if web_sim_launcher is not None:
+            web_sim_launcher.close()
 
 
 if __name__ == "__main__":

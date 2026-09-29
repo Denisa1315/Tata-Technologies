@@ -1,0 +1,6 @@
+{
+  "name": "SMART-ZONE EDGE GUARDIAN",
+  "description": "Swing-Aware, Fail-Safe Risk Zone for Excavator Operator Safety — Interactive Digital Twin & AI Risk Engine Simulation",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

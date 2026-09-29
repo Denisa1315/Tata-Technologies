@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+  
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom industrial styling */
+.hazard-stripes {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(220, 38, 38, 0.85),
+    rgba(220, 38, 38, 0.85) 14px,
+    rgba(20, 20, 20, 0.95) 14px,
+    rgba(20, 20, 20, 0.95) 28px
+  );
+}
+
+.hazard-stripes-amber {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgba(217, 119, 6, 0.75),
+    rgba(217, 119, 6, 0.75) 12px,
+    rgba(20, 20, 20, 0.9) 12px,
+    rgba(20, 20, 20, 0.9) 24px
+  );
+}
+
+.radar-grid {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+}
+
+.radar-grid-light {
+  background-size: 40px 40px;
+  background-image: 
+    linear-gradient(to right, rgba(0, 0, 0, 0.06) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.06) 1px, transparent 1px);
+}
+
+/* Realistic gravel, trench, and worksite ground styles */
+.site-ground-dark {
+  background-color: #121316;
+  background-image: 
+    radial-gradient(#1e2128 1px, transparent 1px),
+    radial-gradient(#171920 1px, #0e1014 1px);
+  background-size: 24px 24px, 48px 48px;
+  background-position: 0 0, 12px 12px;
+}
+
+.site-ground-light {
+  background-color: #e5e0d8;
+  background-image: 
+    radial-gradient(#d3cbbf 1.2px, transparent 1.2px),
+    radial-gradient(#ded7cc 1.2px, #ece7df 1.2px);
+  background-size: 24px 24px, 48px 48px;
+  background-position: 0 0, 12px 12px;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: #0a0a0c;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}

@@ -368,7 +368,8 @@ class TestPollKeys:
     def test_recognized_keys_are_returned(self):
         view = SimView()
         for key_char, expected in [
-            ("q", "q"), ("c", "c"), ("r", "r"), ("s", "s"), ("+", "+"), ("-", "-"), ("h", "h"), ("d", "d"),
+            ("q", "q"), ("c", "c"), ("r", "r"), ("s", "s"), ("+", "+"), ("-", "-"),
+            ("h", "h"), ("d", "d"), ("w", "w"),
         ]:
             with patch("cv2.waitKey", return_value=ord(key_char)):
                 assert view.poll_keys() == expected

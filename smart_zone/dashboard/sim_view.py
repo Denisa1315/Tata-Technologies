@@ -587,7 +587,7 @@ class SimView:
 
     def _draw_control_hints(self, canvas: np.ndarray) -> None:
         t = self._theme
-        hints = "[Q] Quit  [C] Fault  [R] Reset  [+/-] Speed  [S] Snapshot  [H] Hologram  [D] Theme"
+        hints = "[Q] Quit  [C] Fault  [R] Reset  [+/-] Speed  [S] Snapshot  [H] Hologram  [D] Theme  [W] Web Simulation"
         (hw, _), _ = cv2.getTextSize(hints, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
         cv2.putText(canvas, hints, (WINDOW_W - hw - 10, WINDOW_H - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, t.text_dim, 1)
@@ -631,15 +631,17 @@ class SimView:
 
     def poll_keys(self, wait_ms: int = 1) -> str | None:
         """Returns a single-character key label for a recognized control key
-        pressed this frame ('q', 'c', 'r', '+', '-', 's', 'h', 'd'), or None.
-        Does NOT interpret or act on the key -- that's app.py's job (though
-        this class does own toggle_theme() itself, called by app.py when it
-        sees 'd' -- see its docstring)."""
+        pressed this frame ('q', 'c', 'r', '+', '-', 's', 'h', 'd', 'w'), or
+        None. Does NOT interpret or act on the key -- that's app.py's job
+        (though this class does own toggle_theme() itself, called by app.py
+        when it sees 'd' -- see its docstring). 'w' (launch the web
+        simulation) is likewise just reported here; app.py decides what to
+        do with it, via dashboard.web_launcher.WebSimLauncher."""
         key = cv2.waitKey(wait_ms) & 0xFF
         if key == 255:
             return None
         char = chr(key) if key < 128 else None
-        if char in {"q", "c", "r", "s", "h", "d"}:
+        if char in {"q", "c", "r", "s", "h", "d", "w"}:
             return char
         if char in {"+", "="}:  # '=' so it works without needing shift on most layouts
             return "+"
