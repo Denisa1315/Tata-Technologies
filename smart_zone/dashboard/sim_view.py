@@ -40,10 +40,10 @@ PLOT_SCALE_PX_PER_M = 30.0
 GRID_STEP_M = 1.0
 
 COLOR_BY_STATE_NAME = {
-    "SAFE": (0, 200, 0),
-    "WARNING": (0, 210, 255),
-    "CRITICAL": (0, 0, 255),
-    "DEGRADED": (140, 140, 140),
+    "SAFE": (0, 200, 0),       # green
+    "WARNING": (0, 165, 255),  # amber
+    "CRITICAL": (0, 0, 255),   # red
+    "DEGRADED": (140, 140, 140),  # gray
 }
 COLOR_TEXT = (240, 240, 240)
 COLOR_GRID = (50, 50, 50)
@@ -98,6 +98,7 @@ class SimViewState:
     computed by app.py. sim_view reads this and nothing else."""
     risk_state: str  # "SAFE" / "WARNING" / "CRITICAL" / "DEGRADED"
     ttc_s: float | None
+    use_prediction: bool  # when False, TTC and the forecast line are never drawn
 
     machine_pivot: tuple[float, float]
     machine_angle_deg: float
@@ -179,7 +180,6 @@ class SimView:
     def _draw_workers(self, canvas: np.ndarray, state: SimViewState) -> None:
         for w in state.workers:
             pos_px = self._world_to_px(w.position)
-            forecast_px = self._world_to_px(w.forecast_position)
 
             dot_color = ZONE_LEVEL_COLOR.get(w.zone_level, (255, 255, 255))
             # LOW confidence draws a thin outline ring around the dot, so
@@ -187,7 +187,11 @@ class SimView:
             if w.position_confidence == "LOW":
                 cv2.circle(canvas, pos_px, 11, dot_color, 1)
             cv2.circle(canvas, pos_px, 7, dot_color, -1)
-            cv2.line(canvas, pos_px, forecast_px, COLOR_FORECAST, 2)
+
+            if state.use_prediction:
+                forecast_px = self._world_to_px(w.forecast_position)
+                cv2.line(canvas, pos_px, forecast_px, COLOR_FORECAST, 2)
+
             label = f"id={w.track_id} [{w.zone_level}]"
             if w.position_confidence == "LOW":
                 label += " (LOW conf)"
@@ -214,8 +218,14 @@ class SimView:
         cv2.rectangle(canvas, (0, 0), (WINDOW_W, BANNER_H), (15, 15, 15), -1)
         cv2.putText(canvas, state.risk_state, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.4, color, 3)
 
-        ttc_str = f"{state.ttc_s:.1f}s" if state.ttc_s is not None else "--"
-        cv2.putText(canvas, f"TTC: {ttc_str}", (330, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_TEXT, 2)
+        next_x = 330
+        if state.use_prediction:
+            ttc_str = f"{state.ttc_s:.1f}s" if state.ttc_s is not None else "--"
+            cv2.putText(canvas, f"TTC: {ttc_str}", (next_x, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLOR_TEXT, 2)
+            next_x += 220
+
+        if state.risk_state == "CRITICAL":
+            cv2.putText(canvas, "PERSON IN ZONE", (next_x, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
         if state.camera_fault_simulated:
             cv2.putText(canvas, "CAMERA FAULT", (WINDOW_W - 500, 45),
@@ -328,13 +338,13 @@ class SimView:
 
     def poll_keys(self, wait_ms: int = 1) -> str | None:
         """Returns a single-character key label for a recognized control key
-        pressed this frame ('q', 'c', 'r', '+', '-', 's'), or None. Does NOT
-        interpret or act on the key -- that's app.py's job."""
+        pressed this frame ('q', 'c', 'r', '+', '-', 's', 'h'), or None. Does
+        NOT interpret or act on the key -- that's app.py's job."""
         key = cv2.waitKey(wait_ms) & 0xFF
         if key == 255:
             return None
         char = chr(key) if key < 128 else None
-        if char in {"q", "c", "r", "s"}:
+        if char in {"q", "c", "r", "s", "h"}:
             return char
         if char in {"+", "="}:  # '=' so it works without needing shift on most layouts
             return "+"

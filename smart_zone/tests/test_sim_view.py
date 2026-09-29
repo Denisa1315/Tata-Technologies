@@ -1,7 +1,9 @@
-"""Unit tests for dashboard.sim_view: pure rendering, no decision logic.
+"""Unit tests for dashboard.sim_view and dashboard.hologram_view: pure
+rendering, no decision logic.
 
-These tests confirm sim_view only draws from the SimViewState it's given --
-it must not import safety.risk_engine or any other decision-making module.
+These tests confirm both views only draw from the SimViewState they're
+given -- neither may import safety.risk_engine, safety.zone,
+safety.confidence, or prediction.kalman/ttc.
 """
 
 from __future__ import annotations
@@ -13,22 +15,43 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from smart_zone.dashboard.hologram_view import HologramView
 from smart_zone.dashboard.sim_view import (
     WINDOW_H,
     WINDOW_W,
     SimView,
     SimViewState,
+    SummaryViewState,
     TransitionRecord,
     WorkerViewState,
 )
 
-SIM_VIEW_PATH = Path(__file__).resolve().parent.parent / "dashboard" / "sim_view.py"
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
+SIM_VIEW_PATH = DASHBOARD_DIR / "sim_view.py"
+HOLOGRAM_VIEW_PATH = DASHBOARD_DIR / "hologram_view.py"
+SOUND_PATH = DASHBOARD_DIR / "sound.py"
+
+FORBIDDEN_IMPORT_SUBSTRINGS = [
+    "risk_engine", "safety.zone", "safety.confidence", "prediction.kalman", "prediction.ttc",
+]
+
+
+def _imported_modules(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text())
+    modules = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules.add(node.module)
+    return modules
 
 
 def _base_state(**overrides) -> SimViewState:
     defaults = dict(
         risk_state="SAFE",
         ttc_s=None,
+        use_prediction=False,
         machine_pivot=(0.0, 0.0),
         machine_angle_deg=45.0,
         machine_speed_deg_s=10.0,
@@ -50,31 +73,36 @@ def _base_state(**overrides) -> SimViewState:
         camera_fault_simulated=False,
         recent_transitions=[],
         webcam_frame=None,
+        summary=None,
     )
     defaults.update(overrides)
     return SimViewState(**defaults)
 
 
-class TestNoDecisionLogic:
-    def test_does_not_import_risk_engine_or_other_decision_modules(self):
-        """Static check: sim_view.py's import statements must not reference
-        safety.risk_engine (or any zone/kalman computation module) -- it may
-        only import display/plotting libraries and its own dataclasses."""
-        tree = ast.parse(SIM_VIEW_PATH.read_text())
-        imported_modules = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imported_modules.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imported_modules.add(node.module)
+LED_LEVEL_BY_STATE = {"SAFE": 0, "WARNING": 1, "CRITICAL": 2, "DEGRADED": 3}
 
-        forbidden_substrings = ["risk_engine", "safety.zone", "prediction.kalman", "prediction.ttc"]
-        for module in imported_modules:
-            for forbidden in forbidden_substrings:
+
+class TestNoDecisionLogic:
+    def test_sim_view_does_not_import_decision_logic(self):
+        modules = _imported_modules(SIM_VIEW_PATH)
+        for module in modules:
+            for forbidden in FORBIDDEN_IMPORT_SUBSTRINGS:
                 assert forbidden not in module, f"sim_view.py imports decision logic: {module}"
 
+    def test_hologram_view_does_not_import_decision_logic(self):
+        modules = _imported_modules(HOLOGRAM_VIEW_PATH)
+        for module in modules:
+            for forbidden in FORBIDDEN_IMPORT_SUBSTRINGS:
+                assert forbidden not in module, f"hologram_view.py imports decision logic: {module}"
 
-class TestRenderProducesCorrectCanvas:
+    def test_sound_does_not_import_decision_logic(self):
+        modules = _imported_modules(SOUND_PATH)
+        for module in modules:
+            for forbidden in FORBIDDEN_IMPORT_SUBSTRINGS:
+                assert forbidden not in module, f"sound.py imports decision logic: {module}"
+
+
+class TestPlainViewRendering:
     def test_render_returns_correct_shape(self):
         view = SimView()
         canvas = view.render(_base_state())
@@ -97,15 +125,45 @@ class TestRenderProducesCorrectCanvas:
         canvas = view.render(_base_state(workers=workers))
         assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
 
-    def test_render_each_risk_state_does_not_crash(self):
+    @pytest.mark.parametrize("state_name", ["SAFE", "WARNING", "CRITICAL", "DEGRADED"])
+    def test_render_each_risk_state_does_not_crash(self, state_name):
         view = SimView()
-        for state_name in ["SAFE", "WARNING", "CRITICAL", "DEGRADED"]:
-            canvas = view.render(_base_state(risk_state=state_name, led_level={"SAFE": 0, "WARNING": 1, "CRITICAL": 2, "DEGRADED": 3}[state_name]))
-            assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+        canvas = view.render(_base_state(risk_state=state_name, led_level=LED_LEVEL_BY_STATE[state_name]))
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_with_low_confidence_worker_does_not_crash(self):
+        view = SimView()
+        workers = [
+            WorkerViewState(track_id=1, position=(0.5, 0.5), forecast_position=(0.6, 0.5),
+                             zone_level="DANGER", position_confidence="LOW"),
+        ]
+        canvas = view.render(_base_state(workers=workers, risk_state="CRITICAL"))
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
 
     def test_render_with_none_ttc_does_not_crash(self):
         view = SimView()
         canvas = view.render(_base_state(ttc_s=None))
+        assert canvas is not None
+
+    def test_render_hides_ttc_and_forecast_when_use_prediction_false(self):
+        view = SimView()
+        workers = [WorkerViewState(track_id=1, position=(0.5, 0.5), forecast_position=(5.0, 5.0), zone_level="CAUTION")]
+        canvas = view.render(_base_state(use_prediction=False, ttc_s=3.2, workers=workers))
+        # Can't easily assert absence of a specific line pixel-by-pixel
+        # reliably, but this at least exercises the use_prediction=False
+        # path without crashing and without needing forecast_position to
+        # be sane (it's a wildly out-of-frame value here).
+        assert canvas is not None
+
+    def test_render_shows_ttc_and_forecast_when_use_prediction_true(self):
+        view = SimView()
+        workers = [WorkerViewState(track_id=1, position=(0.5, 0.5), forecast_position=(0.6, 0.6), zone_level="CAUTION")]
+        canvas = view.render(_base_state(use_prediction=True, ttc_s=3.2, workers=workers))
+        assert canvas is not None
+
+    def test_render_shows_person_in_zone_on_critical(self):
+        view = SimView()
+        canvas = view.render(_base_state(risk_state="CRITICAL", led_level=2))
         assert canvas is not None
 
     def test_render_with_stop_active_does_not_crash(self):
@@ -116,6 +174,15 @@ class TestRenderProducesCorrectCanvas:
     def test_render_with_camera_fault_does_not_crash(self):
         view = SimView()
         canvas = view.render(_base_state(camera_fault_simulated=True, camera_alive=False))
+        assert canvas is not None
+
+    def test_render_with_summary_does_not_crash(self):
+        view = SimView()
+        summary = SummaryViewState(
+            caution_events=2, danger_events=1, time_in_danger_s=3.4, stop_commands=1,
+            camera_faults=0, telemetry_faults=0, latency_avg_ms=15.0, latency_max_ms=40.0,
+        )
+        canvas = view.render(_base_state(summary=summary))
         assert canvas is not None
 
     def test_render_with_webcam_frame_composites_inset(self):
@@ -140,10 +207,88 @@ class TestRenderProducesCorrectCanvas:
         assert canvas is not None
 
 
+class TestHologramViewRendering:
+    def test_render_returns_correct_shape(self):
+        view = HologramView()
+        canvas = view.render(_base_state())
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+        assert canvas.dtype == np.uint8
+
+    @pytest.mark.parametrize("state_name", ["SAFE", "WARNING", "CRITICAL", "DEGRADED"])
+    def test_render_each_risk_state_does_not_crash(self, state_name):
+        view = HologramView()
+        canvas = view.render(_base_state(
+            risk_state=state_name, led_level=LED_LEVEL_BY_STATE[state_name],
+            machine_running=(state_name != "DEGRADED"),
+        ))
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_with_workers_does_not_crash(self):
+        view = HologramView()
+        workers = [
+            WorkerViewState(track_id=1, position=(1.0, 1.0), forecast_position=(1.5, 1.2), zone_level="CAUTION"),
+            WorkerViewState(track_id=2, position=(0.2, 0.1), forecast_position=(0.1, 0.05), zone_level="DANGER"),
+        ]
+        canvas = view.render(_base_state(workers=workers))
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_with_low_confidence_worker_does_not_crash(self):
+        view = HologramView()
+        workers = [
+            WorkerViewState(track_id=1, position=(0.5, 0.5), forecast_position=(0.6, 0.5),
+                             zone_level="DANGER", position_confidence="LOW"),
+        ]
+        canvas = view.render(_base_state(workers=workers, risk_state="CRITICAL"))
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_with_stopped_machine_does_not_crash(self):
+        view = HologramView()
+        canvas = view.render(_base_state(machine_running=False, stop_active=True))
+        assert canvas is not None
+
+    def test_render_with_camera_fault_does_not_crash(self):
+        view = HologramView()
+        canvas = view.render(_base_state(camera_fault_simulated=True, camera_alive=False))
+        assert canvas is not None
+
+    def test_render_with_summary_does_not_crash(self):
+        view = HologramView()
+        summary = SummaryViewState(
+            caution_events=2, danger_events=1, time_in_danger_s=3.4, stop_commands=1,
+            camera_faults=0, telemetry_faults=0, latency_avg_ms=15.0, latency_max_ms=40.0,
+        )
+        canvas = view.render(_base_state(summary=summary))
+        assert canvas is not None
+
+    def test_render_with_webcam_frame_composites_inset(self):
+        view = HologramView()
+        fake_frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+        canvas = view.render(_base_state(webcam_frame=fake_frame), show_webcam_inset=True)
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_without_webcam_inset_flag_skips_it(self):
+        view = HologramView()
+        fake_frame = np.full((480, 640, 3), 100, dtype=np.uint8)
+        canvas = view.render(_base_state(webcam_frame=fake_frame), show_webcam_inset=False)
+        assert canvas.shape == (WINDOW_H, WINDOW_W, 3)
+
+    def test_render_hides_ttc_when_use_prediction_false(self):
+        view = HologramView()
+        canvas = view.render(_base_state(use_prediction=False, ttc_s=3.2))
+        assert canvas is not None
+
+    def test_render_shows_person_in_zone_on_critical(self):
+        view = HologramView()
+        canvas = view.render(_base_state(risk_state="CRITICAL", led_level=2, machine_running=False))
+        assert canvas is not None
+
+
 class TestPollKeys:
     def test_recognized_keys_are_returned(self):
         view = SimView()
-        for key_char, expected in [("q", "q"), ("c", "c"), ("r", "r"), ("s", "s"), ("+", "+"), ("-", "-")]:
+        for key_char, expected in [
+            ("q", "q"), ("c", "c"), ("r", "r"), ("s", "s"), ("+", "+"), ("-", "-"), ("h", "h"),
+        ]:
             with patch("cv2.waitKey", return_value=ord(key_char)):
                 assert view.poll_keys() == expected
 

@@ -26,6 +26,7 @@ import cv2
 import serial
 import yaml
 
+from smart_zone.dashboard.hologram_view import HologramView
 from smart_zone.dashboard.sim_view import (
     SimView,
     SimViewState,
@@ -33,6 +34,7 @@ from smart_zone.dashboard.sim_view import (
     TransitionRecord,
     WorkerViewState,
 )
+from smart_zone.dashboard.sound import SoundController
 from smart_zone.hardware.mock_outputs import MockHardwareOutputs
 from smart_zone.hardware.outputs import HardwareOutputs
 from smart_zone.hardware.sim_outputs import SimHardwareOutputs
@@ -186,6 +188,9 @@ def main() -> None:
     # (poll_keys()); interpreting a key press as "simulate a camera fault"
     # or "reset the scenario" happens here, in app.py.
     sim_view = SimView(show_webcam_inset=not args.no_webcam_inset) if args.sim else None
+    hologram_view = HologramView() if args.sim else None
+    hologram_enabled = False
+    sound_controller = SoundController() if args.sim else None
     camera_fault_simulated = False
     recent_transitions: list[TransitionRecord] = []
     video_writer = None
@@ -378,6 +383,7 @@ def main() -> None:
                 view_state = SimViewState(
                     risk_state=assessment.state.name,
                     ttc_s=assessment.min_ttc_s,
+                    use_prediction=risk_cfg["use_prediction"],
                     machine_pivot=pivot,
                     machine_angle_deg=machine.angle_deg,
                     machine_speed_deg_s=machine.speed_deg_s,
@@ -410,8 +416,13 @@ def main() -> None:
                         latency_max_ms=run_summary.latency.max_ms,
                     ),
                 )
-                canvas = sim_view.render(view_state)
+                if hologram_enabled and hologram_view is not None:
+                    canvas = hologram_view.render(view_state, show_webcam_inset=not args.no_webcam_inset)
+                else:
+                    canvas = sim_view.render(view_state)
                 sim_view.show(canvas)
+
+                sound_controller.update(assessment.state.name, assessment.buzzer_should_sound, now=now)
 
                 if video_writer is not None:
                     video_writer.write(canvas)
@@ -419,6 +430,8 @@ def main() -> None:
                 key = sim_view.poll_keys(wait_ms=1)
                 if key == "q":
                     break
+                elif key == "h":
+                    hologram_enabled = not hologram_enabled
                 elif key == "c":
                     camera_fault_simulated = not camera_fault_simulated
                 elif key == "r":
