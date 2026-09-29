@@ -7,13 +7,14 @@ perception:
     persistence_frames: 3  # min consecutive frames before a track is "trusted"
     tracker_config: "bytetrack.yaml"
 
-# PLACEHOLDER values -- replace with real measurements from your excavator.
-# pivot_m should be wherever you chose your calibration's world-coordinate
-# origin to sit relative to the machine (e.g. (0,0) if you calibrated with
-# the origin at the machine's base/slew axis).
+# Calibrated 2026-09-29 against a real 1.5m x 1.0m floor rectangle (4 point
+# correspondences in config/calibration.yaml), origin (0,0) at one corner.
+# pivot_m is the machine's slew-axis location in that same world frame --
+# centered on the x=0 edge (between the (0,0) and (0,1.0) corner markers),
+# matching where the machine physically sits relative to that corner.
 machine_geometry:
-  pivot_m: [0.0, 0.0]   # slew-axis location, ground-plane meters
-  radius_m: 3.0         # arm/boom length, meters
+  pivot_m: [0.0, 0.5]   # slew-axis location, ground-plane meters
+  radius_m: 3.0         # arm/boom length, meters -- still a placeholder, measure your real boom
 
 # Camera's own ground-plane position, in the same world coordinates as
 # pivot_m -- used only for distance_to_camera_m (localization-confidence
@@ -34,8 +35,19 @@ safety:
     stopping_coeff: 0.3       # seconds-equivalent braking-response coefficient
     human_speed_mps: 1.6      # assumed worker walking speed
     reaction_time_s: 0.3      # assumed worker/system reaction time
-    margin_m: 0.1             # fixed safety pad added to protective_distance
-    caution_band_m: 0.7       # width of the outer caution ring beyond the danger ellipse
+    # margin_m and caution_band_m reduced 2026-09-29 to fit the real
+    # calibrated 1.5m x 1.0m test rectangle (farthest corner from pivot
+    # (0,0.5) is 1.581m away): at the demo default swing speed (20 deg/s),
+    # worst-case reach (center offset + caution semi_major) is ~1.36m,
+    # leaving ~0.22m of genuine SAFE margin at the corner. Fits speeds up
+    # to ~20-25 deg/s; faster swings (e.g. repeatedly pressing '+' live)
+    # will again cover most/all of this small rectangle -- that's a
+    # consequence of the test area being small relative to radius_m=3.0m
+    # (itself still a placeholder), not something margin/band alone fix
+    # for all speeds. Revisit both once real machine dimensions and a
+    # larger test area are available.
+    margin_m: 0.05            # fixed safety pad added to protective_distance
+    caution_band_m: 0.2       # width of the outer caution ring beyond the danger ellipse
     baseline_radius_m: 0.58   # zone size (circle) when the machine is stationary
     offset_ratio: 0.3         # danger-ellipse center offset toward swing heading, as a fraction of tangential speed's contribution to protective_distance
     core_ratio: 0.5       # legacy: CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse -- only used when use_prediction is true

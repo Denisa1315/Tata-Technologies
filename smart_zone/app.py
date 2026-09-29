@@ -28,6 +28,8 @@ import yaml
 
 from smart_zone.dashboard.hologram_view import HologramView
 from smart_zone.dashboard.sim_view import (
+    WINDOW_H,
+    WINDOW_W,
     SimView,
     SimViewState,
     SummaryViewState,
@@ -198,7 +200,7 @@ def main() -> None:
 
     if args.sim and args.record:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_writer = cv2.VideoWriter(args.record, fourcc, 20.0, (1280, 720))
+        video_writer = cv2.VideoWriter(args.record, fourcc, 20.0, (WINDOW_W, WINDOW_H))
         if not video_writer.isOpened():
             raise RuntimeError(f"Could not open video writer for {args.record}")
 
@@ -307,6 +309,9 @@ def main() -> None:
                         track_id=t.track_id, position=position,
                         forecast_position=(estimate.forecast_x, estimate.forecast_y),
                         zone_level=zone_level.value, position_confidence=conf.confidence.value,
+                        distance_to_machine_m=conf.distance_to_machine_m,
+                        distance_to_camera_m=conf.distance_to_camera_m,
+                        detection_confidence_pct=t.confidence * 100.0,
                     ))
                     worker_log_basics.append(dict(
                         worker_label=f"track_{t.track_id}",
@@ -380,6 +385,20 @@ def main() -> None:
                         x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy)
                         cv2.rectangle(webcam_inset, (x1, y1), (x2, y2), color, 2)
 
+                # Pure display aggregation from values already computed
+                # above -- no new decision logic, just min()/max() over the
+                # same per-worker data already fed into the risk engine.
+                closest_distance_m = (
+                    min(w.distance_to_machine_m for w in worker_view_states)
+                    if worker_view_states else None
+                )
+                zone_severity = {"OUTSIDE": 0, "CAUTION": 1, "DANGER": 2}
+                highest_risk_worker_label = (
+                    f"W-{max(worker_view_states, key=lambda w: zone_severity[w.zone_level]).track_id:02d}"
+                    if worker_view_states else None
+                )
+                interlock_action = "STOP" if assessment.state in {RiskState.CRITICAL, RiskState.DEGRADED} else "MONITOR"
+
                 view_state = SimViewState(
                     risk_state=assessment.state.name,
                     ttc_s=assessment.min_ttc_s,
@@ -415,6 +434,10 @@ def main() -> None:
                         latency_avg_ms=run_summary.latency.average_ms,
                         latency_max_ms=run_summary.latency.max_ms,
                     ),
+                    closest_distance_m=closest_distance_m,
+                    highest_risk_worker_label=highest_risk_worker_label,
+                    interlock_action=interlock_action,
+                    camera_ground_position=camera_ground_position,
                 )
                 if hologram_enabled and hologram_view is not None:
                     canvas = hologram_view.render(view_state, show_webcam_inset=not args.no_webcam_inset)
@@ -432,6 +455,11 @@ def main() -> None:
                     break
                 elif key == "h":
                     hologram_enabled = not hologram_enabled
+                elif key == "d":
+                    # Theme only affects the plain view -- hologram_view's
+                    # own dark aesthetic is untouched either way.
+                    new_theme = sim_view.toggle_theme()
+                    print(f"Theme -> {new_theme.name}")
                 elif key == "c":
                     camera_fault_simulated = not camera_fault_simulated
                 elif key == "r":
