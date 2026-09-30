@@ -61,7 +61,7 @@ STATE_GLOW_COLOR = {
 ZONE_LEVEL_GLOW_COLOR = {
     "DANGER": (0, 0, 255),
     "CAUTION": (0, 210, 255),
-    "OUTSIDE": (255, 220, 40),
+    "OUTSIDE": (0, 255, 0),
 }
 
 

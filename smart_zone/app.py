@@ -82,6 +82,25 @@ DISPLAY_COLOR_BY_STATE = {
     RiskState.CRITICAL: (0, 0, 255),
     RiskState.DEGRADED: (255, 0, 255),
 }
+# Per-worker box color on the camera overlay -- keyed by that worker's OWN
+# zone_level (never by the aggregate assessment.state), so a DANGER worker
+# turning a box red never repaints an OUTSIDE/CAUTION worker's own box.
+DISPLAY_COLOR_BY_ZONE_LEVEL = {
+    "OUTSIDE": (0, 200, 0),
+    "CAUTION": (0, 200, 255),
+    "DANGER": (0, 0, 255),
+}
+
+
+def _worker_box_color(zone_level_by_track_id: dict[int, str], track_id: int) -> tuple[int, int, int]:
+    """The camera-overlay box color for one worker, read from THAT worker's
+    own zone_level only -- never from the aggregate risk state. Pulled out
+    as its own function (rather than inline per call site) so both overlay
+    blocks in main()'s loop and the test suite call the exact same
+    per-worker color decision. An unknown track_id defaults to OUTSIDE
+    (green), never to the aggregate state."""
+    zone_level = zone_level_by_track_id.get(track_id, "OUTSIDE")
+    return DISPLAY_COLOR_BY_ZONE_LEVEL[zone_level]
 
 
 def _load_thresholds() -> dict:
@@ -378,14 +397,23 @@ def main() -> None:
                     ))
                 last_reported_state = assessment.state
 
+            # Per-worker zone_level, keyed by track_id (never by list index,
+            # so this stays correct even if a worker is added/removed
+            # mid-session) -- built once from the same per-worker records
+            # already produced above, for both overlay blocks below to share.
+            zone_level_by_track_id = {w.track_id: w.zone_level for w in worker_view_states}
+
             if args.sim and sim_view is not None:
                 webcam_inset = None
                 if not args.no_webcam_inset and ok:
                     webcam_inset = frame.copy()
-                    color = DISPLAY_COLOR_BY_STATE[assessment.state]
                     for t in trusted:
                         x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy)
-                        cv2.rectangle(webcam_inset, (x1, y1), (x2, y2), color, 2)
+                        box_color = _worker_box_color(zone_level_by_track_id, t.track_id)
+                        zone_level = zone_level_by_track_id.get(t.track_id, "OUTSIDE")
+                        cv2.rectangle(webcam_inset, (x1, y1), (x2, y2), box_color, 2)
+                        cv2.putText(webcam_inset, f"W-{t.track_id:02d} {zone_level}", (x1, max(y1 - 8, 12)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 1)
 
                 # Pure display aggregation from values already computed
                 # above -- no new decision logic, just min()/max() over the
@@ -495,10 +523,11 @@ def main() -> None:
                     print(f"Saved snapshot: {snap_path}")
 
             elif ok and not args.no_display:
-                color = DISPLAY_COLOR_BY_STATE[assessment.state]
                 for t in trusted:
                     x1, y1, x2, y2 = (int(v) for v in t.bbox_xyxy)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    box_color = _worker_box_color(zone_level_by_track_id, t.track_id)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                color = DISPLAY_COLOR_BY_STATE[assessment.state]
                 cv2.putText(frame, f"STATE: {assessment.state.name}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
                 cv2.putText(frame, f"FPS: {fps:.1f}", (10, 60),

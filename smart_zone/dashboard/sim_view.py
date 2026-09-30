@@ -61,7 +61,7 @@ COLOR_BY_STATE_NAME = {
 ZONE_LEVEL_COLOR = {
     "DANGER": (0, 0, 220),
     "CAUTION": (0, 170, 230),
-    "OUTSIDE": (140, 140, 140),
+    "OUTSIDE": (0, 170, 0),
 }
 
 
@@ -237,6 +237,41 @@ STATUS_LINE_BY_STATE = {
     "DEGRADED": "Sensor or telemetry fault. Machine forced to STOP.",
 }
 
+# Sidebar text layout: every plain-text line (panel headers, kv-card
+# labels aside) uses this single left margin and row pitch, so nothing is
+# positioned by an ad-hoc per-call offset.
+SIDEBAR_LEFT_MARGIN_PX = 14
+LINE_HEIGHT_PX = 18
+
+
+def draw_excavator_icon(frame: np.ndarray, base_xy: tuple[int, int], angle_deg: float, color) -> None:
+    """Draws a small excavator silhouette at `base_xy` (screen px), boom
+    pointed at `angle_deg` (same convention as the machine's swing angle),
+    in a single flat `color` (BGR). Primitive cv2 shapes only, no assets."""
+    bx, by = base_xy
+    angle_rad = math.radians(angle_deg)
+    dx, dy = math.cos(angle_rad), math.sin(angle_rad)
+
+    # Track/base, then body ("house"), both centered on base_xy.
+    cv2.rectangle(frame, (bx - 16, by + 6), (bx + 16, by + 12), color, -1)
+    cv2.rectangle(frame, (bx - 11, by - 8), (bx + 11, by + 7), color, -1)
+
+    # Boom: a line from the body out along the swing angle, elbowed once
+    # partway for a more excavator-like silhouette than a straight arrow.
+    elbow = (int(bx + dx * 18), int(by + dy * 18 - 6))
+    tip = (int(bx + dx * 34), int(by + dy * 34))
+    cv2.line(frame, (bx, by - 4), elbow, color, 3)
+    cv2.line(frame, elbow, tip, color, 3)
+
+    # Bucket: a small filled triangle at the boom tip, perpendicular to it.
+    perp_x, perp_y = -dy, dx
+    bucket = np.array([
+        tip,
+        (int(tip[0] + perp_x * 7 - dx * 6), int(tip[1] + perp_y * 7 - dy * 6)),
+        (int(tip[0] - perp_x * 7 - dx * 6), int(tip[1] - perp_y * 7 - dy * 6)),
+    ])
+    cv2.fillConvexPoly(frame, bucket, color)
+
 
 class SimView:
     def __init__(self, show_webcam_inset: bool = True, theme: Theme = DARK_THEME) -> None:
@@ -303,19 +338,12 @@ class SimView:
         t = self._theme
         pivot_px = self._world_to_px(state.machine_pivot)
         arm_color = t.arm_running if state.machine_running else t.arm_stopped
-
-        angle_rad = np.radians(state.machine_angle_deg)
-        tip_x = state.machine_pivot[0] + state.machine_arm_length_m * np.cos(angle_rad)
-        tip_y = state.machine_pivot[1] + state.machine_arm_length_m * np.sin(angle_rad)
-        tip_px = self._world_to_px((tip_x, tip_y))
-
-        cv2.line(canvas, pivot_px, tip_px, arm_color, 4)
-        cv2.circle(canvas, pivot_px, 9, arm_color, -1)
-        cv2.circle(canvas, pivot_px, 9, t.main_bg, 1)
-        cv2.circle(canvas, tip_px, 5, arm_color, -1)
+        draw_excavator_icon(canvas, pivot_px, state.machine_angle_deg, arm_color)
 
     def _draw_workers(self, canvas: np.ndarray, state: SimViewState) -> None:
         t = self._theme
+        placed_label_boxes: list[tuple[int, int, int, int]] = []  # (x0, y0, x1, y1), screen px
+
         for w in state.workers:
             pos_px = self._world_to_px(w.position)
 
@@ -328,13 +356,50 @@ class SimView:
                 forecast_px = self._world_to_px(w.forecast_position)
                 cv2.line(canvas, pos_px, forecast_px, t.forecast_line, 2)
 
-            cv2.putText(canvas, f"W-{w.track_id:02d}", (pos_px[0] + 10, pos_px[1] - 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, dot_color, 1)
+            id_label = f"W-{w.track_id:02d}"
             dist_label = f"{w.distance_to_machine_m:.1f}m"
             if w.position_confidence == "LOW":
                 dist_label += " LOW"
-            cv2.putText(canvas, dist_label, (pos_px[0] + 10, pos_px[1] + 4),
+
+            label_x = pos_px[0] + 10
+            label_y_id, label_y_dist = self._place_worker_label(
+                placed_label_boxes, label_x, pos_px[1], id_label, dist_label)
+
+            cv2.putText(canvas, id_label, (label_x, label_y_id),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, dot_color, 1)
+            cv2.putText(canvas, dist_label, (label_x, label_y_dist),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, t.text, 1)
+
+    def _place_worker_label(self, placed_label_boxes: list[tuple[int, int, int, int]],
+                             label_x: int, anchor_y: int, id_label: str, dist_label: str) -> tuple[int, int]:
+        """Returns (id_y, dist_y) baselines for this worker's two-line label,
+        starting at the anchor's default offsets and shifting the whole
+        block down in fixed steps until it no longer overlaps a
+        previously-placed label. Only meant for the realistic case of a
+        handful of on-screen workers -- not a general label-layout solver."""
+        (id_w, id_h), _ = cv2.getTextSize(id_label, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        (dist_w, dist_h), _ = cv2.getTextSize(dist_label, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+        block_w = max(id_w, dist_w)
+        step_px = 16
+
+        id_y = anchor_y - 14
+        for _ in range(8):  # bounded search; 2-4 workers never need many steps
+            top = id_y - id_h
+            bottom = id_y + step_px + max(dist_h, 4)
+            box = (label_x, top, label_x + block_w, bottom)
+            if not any(self._boxes_overlap(box, other) for other in placed_label_boxes):
+                break
+            id_y += step_px
+
+        dist_y = id_y + step_px
+        placed_label_boxes.append((label_x, id_y - id_h, label_x + block_w, dist_y + 4))
+        return id_y, dist_y
+
+    @staticmethod
+    def _boxes_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+        ax0, ay0, ax1, ay1 = a
+        bx0, by0, bx1, by1 = b
+        return not (ax1 < bx0 or ax0 > bx1 or ay1 < by0 or ay0 > by1)
 
     def _draw_main_area(self, canvas: np.ndarray, state: SimViewState) -> None:
         t = self._theme
@@ -411,11 +476,24 @@ class SimView:
 
         cv2.line(canvas, (0, y0 + BANNER_H), (WINDOW_W, y0 + BANNER_H), t.axis, 1)
 
+    def draw_sidebar_line(self, canvas: np.ndarray, x0: int, y: int, text: str,
+                           color=None, scale: float = 0.4, thickness: int = 1) -> int:
+        """Draws one plain-text sidebar line at the shared left margin and
+        returns the y for the next line (y + LINE_HEIGHT_PX), so every
+        plain-text line in the sidebar -- headers included -- shares the
+        same left x-coordinate and a single row pitch, instead of each call
+        site picking its own offset."""
+        t = self._theme
+        if color is None:
+            color = t.text
+        cv2.putText(canvas, text, (x0 + SIDEBAR_LEFT_MARGIN_PX, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
+        return y + LINE_HEIGHT_PX
+
     def _panel_header(self, canvas: np.ndarray, x0: int, y: int, x1: int, text: str) -> int:
         t = self._theme
-        cv2.putText(canvas, text, (x0 + 14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.4, t.header_accent, 1)
-        cv2.line(canvas, (x0 + 12, y + 5), (x1 - 12, y + 5), t.axis, 1)
-        return y + 18
+        next_y = self.draw_sidebar_line(canvas, x0, y, text, t.header_accent, 0.4, 1)
+        cv2.line(canvas, (x0 + SIDEBAR_LEFT_MARGIN_PX - 2, y + 5), (x1 - 12, y + 5), t.axis, 1)
+        return next_y
 
     def _kv_card(self, canvas: np.ndarray, x0: int, y: int, w: int, label: str, value: str,
                  value_color=None) -> None:
@@ -464,9 +542,7 @@ class SimView:
         self._kv_card(canvas, x0 + 24 + col_w, y, col_w, "INTERLOCK ACTION", state.interlock_action, action_color)
         y += 38
         target = state.highest_risk_worker_label or "--"
-        cv2.putText(canvas, f"HIGHEST RISK TARGET: {target}", (x0 + 14, y + 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, t.text, 1)
-        return y + 22
+        return self.draw_sidebar_line(canvas, x0, y + 8, f"HIGHEST RISK TARGET: {target}", t.text, 0.36, 1)
 
     def _draw_worker_register(self, canvas: np.ndarray, state: SimViewState, x0: int, x1: int, y0: int, y1: int) -> None:
         t = self._theme
@@ -475,23 +551,20 @@ class SimView:
         for i, w in enumerate(state.workers):
             if y + row_h > y1:
                 remaining = len(state.workers) - i
-                cv2.putText(canvas, f"+{remaining} more...", (x0 + 14, y + 14),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, t.text_dim, 1)
+                self.draw_sidebar_line(canvas, x0, y + 14, f"+{remaining} more...", t.text_dim, 0.4, 1)
                 break
             zone_color = ZONE_LEVEL_COLOR.get(w.zone_level, t.text)
             cv2.rectangle(canvas, (x0 + 10, y), (x1 - 10, y + row_h - 6), t.card_bg, -1)
-            cv2.putText(canvas, f"W-{w.track_id:02d}", (x0 + 18, y + 17),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, t.text, 1)
+            self.draw_sidebar_line(canvas, x0, y + 17, f"W-{w.track_id:02d}", t.text, 0.44, 1)
             cv2.putText(canvas, w.zone_level, (x1 - 90, y + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.4, zone_color, 1)
             detail = (f"Machine: {w.distance_to_machine_m:.2f}m  Camera: {w.distance_to_camera_m:.2f}m  "
                       f"Conf: {w.detection_confidence_pct:.0f}%")
             conf_color = COLOR_BY_STATE_NAME["CRITICAL"] if w.position_confidence == "LOW" else t.text_dim
-            cv2.putText(canvas, detail, (x0 + 18, y + 34), cv2.FONT_HERSHEY_SIMPLEX, 0.36, conf_color, 1)
+            self.draw_sidebar_line(canvas, x0, y + 34, detail, conf_color, 0.36, 1)
             y += row_h
 
         if not state.workers:
-            cv2.putText(canvas, "No workers currently tracked.", (x0 + 14, y + 14),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, t.text_dim, 1)
+            self.draw_sidebar_line(canvas, x0, y + 14, "No workers currently tracked.", t.text_dim, 0.4, 1)
 
     def _draw_right_panel(self, canvas: np.ndarray, state: SimViewState) -> None:
         t = self._theme
@@ -549,12 +622,12 @@ class SimView:
         buzzer_y = y + 22
         buzzer_color = COLOR_BY_STATE_NAME["CRITICAL"] if (state.buzzer_on and int(time.time() * 4) % 2 == 0) else t.buzzer_off
         cv2.rectangle(canvas, (x0 + 15, buzzer_y), (x1 - 15, buzzer_y + 22), buzzer_color, -1)
-        cv2.putText(canvas, "BUZZER", (x0 + 24, buzzer_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, t.text, 1)
+        self.draw_sidebar_line(canvas, x0, buzzer_y + 16, "BUZZER", t.text, 0.42, 1)
 
         y = buzzer_y + 30
         if state.stop_active:
             cv2.rectangle(canvas, (x0 + 15, y), (x1 - 15, y + 22), COLOR_BY_STATE_NAME["CRITICAL"], -1)
-            cv2.putText(canvas, "STOP ISSUED", (x0 + 24, y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 2)
+            self.draw_sidebar_line(canvas, x0, y + 16, "STOP ISSUED", (255, 255, 255), 0.42, 2)
             y += 30
 
         if state.summary is not None:
@@ -569,10 +642,9 @@ class SimView:
                 f"latency avg/max: {s.latency_avg_ms:.0f}/{s.latency_max_ms:.0f}ms",
             ]
             for line in summary_lines:
-                if y + 16 > y1:
+                if y + LINE_HEIGHT_PX > y1:
                     break
-                cv2.putText(canvas, line, (x0 + 15, y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, t.text_dim, 1)
-                y += 18
+                y = self.draw_sidebar_line(canvas, x0, y, line, t.text_dim, 0.38, 1)
 
     def _draw_webcam_inset(self, canvas: np.ndarray, state: SimViewState) -> None:
         if not self.show_webcam_inset or state.webcam_frame is None:
