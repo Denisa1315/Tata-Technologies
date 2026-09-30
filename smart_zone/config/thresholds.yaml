@@ -7,21 +7,70 @@ perception:
     persistence_frames: 3  # min consecutive frames before a track is "trusted"
     tracker_config: "bytetrack.yaml"
 
-# PLACEHOLDER values -- replace with real measurements from your excavator.
-# pivot_m should be wherever you chose your calibration's world-coordinate
-# origin to sit relative to the machine (e.g. (0,0) if you calibrated with
-# the origin at the machine's base/slew axis).
+# Calibrated 2026-09-29 against a real 1.5m x 1.0m floor rectangle (4 point
+# correspondences in config/calibration.yaml), origin (0,0) at one corner.
+# pivot_m is the machine's slew-axis location in that same world frame --
+# centered on the x=0 edge (between the (0,0) and (0,1.0) corner markers),
+# matching where the machine physically sits relative to that corner.
 machine_geometry:
-  pivot_m: [0.0, 0.0]   # slew-axis location, ground-plane meters
-  radius_m: 3.0         # arm/boom length, meters
+  pivot_m: [0.0, 0.5]   # slew-axis location, ground-plane meters
+  radius_m: 3.0         # arm/boom length, meters -- still a placeholder, measure your real boom
+
+# Camera's own ground-plane position, in the same world coordinates as
+# pivot_m -- used only for distance_to_camera_m (localization-confidence
+# range weighting). Zone/risk decisions never use this, only
+# distance_to_machine_m (from pivot_m).
+camera_geometry:
+  ground_position_m: [0.0, -1.0]  # PLACEHOLDER -- measure your camera's real position
 
 safety:
   zone:
-    core_ratio: 0.5       # CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse
+    # protective_distance = stopping_coeff * tangential_speed
+    #                       + human_speed_mps * reaction_time_s + margin_m
+    # Tuned so protective_distance (the danger-zone size) is about 0.8m at a
+    # realistic top swing speed (~1.0-1.2 m/s tangential for a small
+    # excavator), and the whole zone (danger + caution_band_m) fits within
+    # roughly 1.5-2m across the working speed range. See safety/zone.py for
+    # the full formula documentation.
+    stopping_coeff: 0.3       # seconds-equivalent braking-response coefficient
+    human_speed_mps: 1.6      # assumed worker walking speed
+    reaction_time_s: 0.3      # assumed worker/system reaction time
+    # margin_m and caution_band_m reduced 2026-09-29 to fit the real
+    # calibrated 1.5m x 1.0m test rectangle (farthest corner from pivot
+    # (0,0.5) is 1.581m away): at the demo default swing speed (20 deg/s),
+    # worst-case reach (center offset + caution semi_major) is ~1.36m,
+    # leaving ~0.22m of genuine SAFE margin at the corner. Fits speeds up
+    # to ~20-25 deg/s; faster swings (e.g. repeatedly pressing '+' live)
+    # will again cover most/all of this small rectangle -- that's a
+    # consequence of the test area being small relative to radius_m=3.0m
+    # (itself still a placeholder), not something margin/band alone fix
+    # for all speeds. Revisit both once real machine dimensions and a
+    # larger test area are available.
+    margin_m: 0.05            # fixed safety pad added to protective_distance
+    caution_band_m: 0.2       # width of the outer caution ring beyond the danger ellipse
+    baseline_radius_m: 0.58   # zone size (circle) when the machine is stationary
+    offset_ratio: 0.3         # danger-ellipse center offset toward swing heading, as a fraction of tangential speed's contribution to protective_distance
+    core_ratio: 0.5       # legacy: CRITICAL (core) ellipse size relative to WARNING (outer margin) ellipse -- only used when use_prediction is true
   risk_engine:
+    use_prediction: false  # false = decide from position/zone-level only; true = restore old TTC+forecast behavior
     ttc_warning_s: 4.0
     ttc_critical_s: 1.5
     debounce_s: 1.0
     fps_floor: 8.0
     camera_timeout_s: 0.5
     telemetry_max_age_s: 0.5
+    quiet_when_stationary: true   # when the arm is stopped/slow: cap at WARNING (silent) unless worker is within arm_reach_m
+    stationary_speed_threshold_m_s: 0.05  # tangential speed below which the machine is considered "stationary"
+
+  # Position-confidence scoring: flags a worker's ground-plane position as
+  # LOW confidence when the detection itself looks unreliable (feet cut off
+  # by the frame edge, or box height inconsistent with the projected
+  # ground-plane distance), and grows the caution band with range to
+  # account for growing localization error at a distance. See
+  # safety/confidence.py for the full formula documentation.
+  confidence:
+    edge_margin_px: 8               # box bottom within this many px of the frame edge -> feet not visible
+    height_disagreement_ratio: 0.35  # |actual - expected| / expected box height beyond this -> LOW confidence
+    reference_height_px_at_1m: 800   # calibrate once: a person's box height (px) at 1m from the camera
+    range_margin_slope_m_per_m: 0.05  # extra caution-band meters per meter of distance_to_camera_m
+    range_margin_max_m: 0.5          # cap on the range-based margin addition

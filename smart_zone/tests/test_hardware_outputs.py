@@ -94,3 +94,49 @@ class TestHardwareOutputs:
         # RESUME should be sent going back to SAFE.
         outputs.apply_state(RiskState.SAFE)
         assert "RESUME" not in ser.sent
+
+
+class TestBuzzerShouldSound:
+    def test_critical_with_buzzer_should_sound_false_stays_silent(self):
+        ser = FakeSerial()
+        outputs = HardwareOutputs(ser)
+        # Start from a state where the buzzer was actually on, so the
+        # transition to a silenced CRITICAL is a real, observable change.
+        outputs.apply_state(RiskState.CRITICAL, buzzer_should_sound=True)
+        outputs.apply_state(RiskState.SAFE)
+        outputs.apply_state(RiskState.CRITICAL, buzzer_should_sound=True)
+        ser.sent.clear()
+
+        outputs.apply_state(RiskState.SAFE)  # buzzer off, state resets
+        outputs.apply_state(RiskState.CRITICAL, buzzer_should_sound=False)
+        assert "BUZZER:ON" not in ser.sent
+        assert "STOP" in ser.sent  # STOP is unaffected by buzzer_should_sound
+
+    def test_buzzer_change_alone_sends_command_even_without_state_change(self):
+        ser = FakeSerial()
+        outputs = HardwareOutputs(ser)
+        outputs.apply_state(RiskState.CRITICAL, buzzer_should_sound=True)
+        ser.sent.clear()
+
+        # state stays CRITICAL, but buzzer_should_sound flips off -- must
+        # still send the buzzer update even with no state transition (and
+        # must not resend LED/STOP, which are unchanged).
+        outputs.apply_state(RiskState.CRITICAL, buzzer_should_sound=False)
+        assert "BUZZER:OFF" in ser.sent
+        assert "LED:2" not in ser.sent  # LED unchanged, no need to resend
+        assert "STOP" not in ser.sent  # already stopped, no need to resend
+
+    def test_no_change_at_all_sends_nothing(self):
+        ser = FakeSerial()
+        outputs = HardwareOutputs(ser)
+        outputs.apply_state(RiskState.WARNING, buzzer_should_sound=True)
+        ser.sent.clear()
+
+        outputs.apply_state(RiskState.WARNING, buzzer_should_sound=True)
+        assert ser.sent == []
+
+    def test_default_buzzer_should_sound_is_true(self):
+        ser = FakeSerial()
+        outputs = HardwareOutputs(ser)
+        outputs.apply_state(RiskState.CRITICAL)  # no buzzer_should_sound arg
+        assert "BUZZER:ON" in ser.sent
